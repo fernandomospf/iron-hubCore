@@ -57,19 +57,55 @@ export class WorkoutPlansService {
   }
 
   async listPublicPlans(req) {
-    const { data, error } = await req.supabase
+    const supabase = req.supabase;
+
+    const { data: plans, error: plansError } = await supabase
       .from('workout_plans')
       .select(`
-        *,
-        workout_exercises (*),
-        workout_plan_like_counts (likes)
-      `)
+      id,
+      name,
+      user_id,
+      is_public,
+      created_at,
+      likes_count,
+      rating_average,
+      ratings_count
+    `)
       .eq('is_public', true)
       .order('created_at', { ascending: false });
 
-    if (error) throw error;
-    return data;
+    if (plansError) throw plansError;
+    if (!plans?.length) return [];
+
+    const planIds = plans.map(p => p.id);
+
+    const { data: exercises, error: exercisesError } = await supabase
+      .from('workout_exercises')
+      .select(`
+      id,
+      workout_plan_id,
+      name,
+      sets,
+      reps,
+      weight,
+      rest_time_seconds
+    `)
+      .in('workout_plan_id', planIds);
+
+    if (exercisesError) throw exercisesError;
+
+    const exercisesByPlan = exercises.reduce((acc, ex) => {
+      if (!acc[ex.workout_plan_id]) acc[ex.workout_plan_id] = [];
+      acc[ex.workout_plan_id].push(ex);
+      return acc;
+    }, {} as Record<string, any[]>);
+
+    return plans.map(plan => ({
+      ...plan,
+      workout_exercises: exercisesByPlan[plan.id] ?? [],
+    }));
   }
+
 
   async toggleLike(req, planId: string) {
     const { error } = await req.supabase
