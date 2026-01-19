@@ -1,4 +1,5 @@
 import { Injectable, InternalServerErrorException } from '@nestjs/common';
+import { ProfileFitnessDataDto } from './dto/profile-fitness-data.dto';
 
 @Injectable()
 export class WorkoutPlansService {
@@ -40,37 +41,225 @@ export class WorkoutPlansService {
     return plan;
   }
 
-
   async listMyPlans(req) {
-    const { data, error } = await req.supabase
+    const supabase = req.supabase;
+    const userId = req.user.id;
+
+    const userFitnessData = await this.getUserFitnessData(req, userId);
+
+    if (!userFitnessData?.weight_kg) {
+      throw new InternalServerErrorException(
+        'User fitness data not found or invalid',
+      );
+    }
+
+    const { data: plans, error } = await supabase
       .from('workout_plans')
       .select(`
         *,
-        workout_exercises (*),
-        workout_plan_like_counts (likes)
+        workout_exercises (*)
       `)
-      .eq('user_id', req.user.id)
+      .eq('user_id', userId)
       .order('created_at', { ascending: false });
 
     if (error) throw error;
-    return data;
+    if (!plans?.length) return [];
+
+    const { data: userLikes } = await supabase
+      .from('workout_plan_likes')
+      .select('workout_plan_id')
+      .eq('user_id', userId);
+
+    const likedSet = new Set(
+      (userLikes ?? []).map(like => like.workout_plan_id)
+    );
+
+    return plans.map((plan) => {
+      if (!plan.training_time) {
+        throw new InternalServerErrorException(
+          `Workout plan ${plan.id} missing training_time`,
+        );
+      }
+
+      const primaryGoal =
+        Array.isArray(plan.goals) && plan.goals.length > 0
+          ? plan.goals[0]
+          : null;
+
+      if (!primaryGoal) {
+        throw new InternalServerErrorException(
+          `Workout plan ${plan.id} missing goal`,
+        );
+      }
+
+      const met = this.getMetByPlan(plan);
+      const calories = this.calculateCaloriesBurned(
+        userFitnessData.weight_kg,
+        Number(plan.training_time),
+        met,
+      );
+
+      return {
+        ...plan,
+        calories,
+        is_liked: likedSet.has(plan.id),
+      };
+    });
   }
 
-  async listPublicPlans(req) {
+  async listMyFavoritePlans(req) {
+  const supabase = req.supabase;
+  const userId = req.user.id;
+
+  const userFitnessData = await this.getUserFitnessData(req, userId);
+  if (!userFitnessData?.weight_kg) {
+    throw new InternalServerErrorException(
+      'User fitness data not found or invalid',
+    );
+  }
+
+  const { data: favorites, error: favError } = await supabase
+    .from('workout_plan_favorites')
+    .select('workout_plan_id')
+    .eq('user_id', userId);
+
+  if (favError) throw favError;
+  if (!favorites?.length) return [];
+
+  const favoritePlanIds = favorites.map(f => f.workout_plan_id);
+
+  const { data: plans, error: plansError } = await supabase
+    .from('workout_plans')
+    .select('*')
+    .in('id', favoritePlanIds)
+    .order('created_at', { ascending: false });
+
+  if (plansError) throw plansError;
+  if (!plans?.length) return [];
+
+  const planIds = plans.map(p => p.id);
+
+  const { data: exercises, error: exercisesError } = await supabase
+    .from('workout_exercises')
+    .select('*')
+    .in('workout_plan_id', planIds);
+
+  if (exercisesError) throw exercisesError;
+
+  const exercisesByPlan = exercises.reduce((acc, ex) => {
+    if (!acc[ex.workout_plan_id]) acc[ex.workout_plan_id] = [];
+    acc[ex.workout_plan_id].push(ex);
+    return acc;
+  }, {} as Record<string, any[]>);
+
+  return plans.map(plan => {
+    const planExercises = exercisesByPlan[plan.id] ?? [];
+
+    const durationMinutes = this.calculatePlanDurationMinutes(planExercises);
+    const primaryGoal = Array.isArray(plan.goals) ? plan.goals[0] : plan.goals;
+    const met = this.getMetByGoal(primaryGoal);
+
+    const calories = this.calculateCaloriesBurned(
+      userFitnessData.weight_kg,
+      durationMinutes,
+      met,
+    );
+
+    return {
+      ...plan,
+      calories,
+      estimated_duration_minutes: Math.round(durationMinutes),
+      workout_exercises: planExercises,
+      is_favorite: true,
+    };
+  });
+}
+
+  async listMyLikedPlans(req) {
     const supabase = req.supabase;
+    const userId = req.user.id;
+
+    const userFitnessData = await this.getUserFitnessData(req, userId);
+
+    if (!userFitnessData?.weight_kg) {
+      throw new InternalServerErrorException(
+        'User fitness data not found or invalid',
+      );
+    }
+
+    const { data: likes, error: likesError } = await supabase
+      .from('workout_plan_likes')
+      .select('workout_plan_id')
+      .eq('user_id', userId);
+
+    if (likesError) throw likesError;
+    if (!likes?.length) return [];
+
+    const likedPlanIds = likes.map(l => l.workout_plan_id);
 
     const { data: plans, error: plansError } = await supabase
       .from('workout_plans')
       .select(`
-      id,
-      name,
-      user_id,
-      is_public,
-      created_at,
-      likes_count,
-      rating_average,
-      ratings_count
+      *,
+      workout_exercises (*)
     `)
+      .in('id', likedPlanIds);
+
+    if (plansError) throw plansError;
+    if (!plans?.length) return [];
+
+    return plans.map(plan => {
+      const primaryGoal =
+        Array.isArray(plan.goals) && plan.goals.length > 0
+          ? plan.goals[0]
+          : null;
+
+      const met = this.getMetByGoal(primaryGoal);
+
+      const durationMinutes = plan.training_time
+        ? Number(plan.training_time)
+        : this.calculatePlanDurationMinutes(plan.workout_exercises ?? []);
+
+      const calories = this.calculateCaloriesBurned(
+        userFitnessData.weight_kg,
+        durationMinutes,
+        met,
+      );
+
+      return {
+        ...plan,
+        calories,
+        is_liked: true,
+      };
+    });
+  }
+
+  async listPublicPlans(req) {
+    const supabase = req.supabase;
+    const { user } = req;
+    const { id: userId } = user;
+
+    const userFitnessData = await this.getUserFitnessData(req, userId);
+    if (!userFitnessData?.weight_kg) {
+      throw new InternalServerErrorException(
+        'User fitness data not found or invalid',
+      );
+    }
+
+    const { data: likes, error: likesError } = await supabase
+      .from('workout_plan_likes')
+      .select('workout_plan_id')
+      .eq('user_id', userId);
+
+    if (likesError) throw likesError;
+
+    const likedSet = new Set(
+      (likes ?? []).map(l => l.workout_plan_id),
+    );
+
+    const { data: plans, error: plansError } = await supabase
+      .from('workout_plans')
+      .select('*')
       .eq('is_public', true)
       .order('created_at', { ascending: false });
 
@@ -81,15 +270,7 @@ export class WorkoutPlansService {
 
     const { data: exercises, error: exercisesError } = await supabase
       .from('workout_exercises')
-      .select(`
-      id,
-      workout_plan_id,
-      name,
-      sets,
-      reps,
-      weight,
-      rest_time_seconds
-    `)
+      .select('*')
       .in('workout_plan_id', planIds);
 
     if (exercisesError) throw exercisesError;
@@ -100,40 +281,107 @@ export class WorkoutPlansService {
       return acc;
     }, {} as Record<string, any[]>);
 
-    return plans.map(plan => ({
-      ...plan,
-      workout_exercises: exercisesByPlan[plan.id] ?? [],
-    }));
+    return plans.map(plan => {
+      const planExercises = exercisesByPlan[plan.id] ?? [];
+
+      const durationMinutes = this.calculatePlanDurationMinutes(planExercises);
+      const met = this.getMetByGoal(
+        Array.isArray(plan.goals) ? plan.goals[0] : plan.goals,
+      );
+
+      const calories = this.calculateCaloriesBurned(
+        userFitnessData.weight_kg,
+        durationMinutes,
+        met,
+      );
+
+      return {
+        ...plan,
+        calories,
+        estimated_duration_minutes: Math.round(durationMinutes),
+        workout_exercises: planExercises,
+        is_liked: likedSet.has(plan.id),
+      };
+    });
   }
 
-
   async toggleLike(req, planId: string) {
-    const { error } = await req.supabase
+    const supabase = req.supabase;
+    const userId = req.user.id;
+
+    const { error: insertError } = await supabase
       .from('workout_plan_likes')
       .insert({
         workout_plan_id: planId,
-        user_id: req.user.id,
+        user_id: userId,
       });
 
-    if (error?.code === '23505') {
-      await req.supabase
+    if (insertError?.code === '23505') {
+      const { error: deleteError } = await supabase
         .from('workout_plan_likes')
         .delete()
         .eq('workout_plan_id', planId)
-        .eq('user_id', req.user.id);
-      return { liked: false };
+        .eq('user_id', userId);
+
+      if (deleteError) throw deleteError;
+
+      return {
+        liked: false,
+      };
     }
 
-    if (error) throw error;
-    return { liked: true };
+    if (insertError) {
+      throw insertError;
+    }
+
+    return {
+      liked: true,
+    };
+  }
+
+  async toggleFavorite(req, planId: string) {
+    const supabase = req.supabase;
+    const userId = req.user.id;
+
+    const { error: insertError } = await supabase
+      .from('workout_plan_favorites')
+      .insert({
+        workout_plan_id: planId,
+        user_id: userId,
+      });
+
+    if (insertError?.code === '23505') {
+      const { error: deleteError } = await supabase
+        .from('workout_plan_favorites')
+        .delete()
+        .eq('workout_plan_id', planId)
+        .eq('user_id', userId);
+
+      if (deleteError) throw deleteError;
+
+      return {
+        favorite: false,
+      };
+    }
+
+    if (insertError) {
+      throw insertError;
+    }
+
+    return {
+      favorite: true,
+    };
   }
 
   async getWorkoutById(
     req,
     dto: { planId: string },
   ) {
-    const { data, error } = await req.supabase
-      .from('workout_exercises')
+    const supabase = req.supabase;
+    const userId = req.user.id;
+
+    const { data, error } = await supabase
+      .from('workout_exercises_with_plan')
       .select('*')
       .eq('workout_plan_id', dto.planId);
 
@@ -141,6 +389,135 @@ export class WorkoutPlansService {
       throw new InternalServerErrorException(error.message);
     }
 
+    if (!data || data.length === 0) {
+      return null;
+    }
+
+    const {
+      workout_plan_id,
+      workout_plan_name,
+      training_time,
+      goals,
+      muscle_groups,
+      workout_type,
+      is_public,
+    } = data[0];
+
+    const userFitnessData = await this.getUserFitnessData(req, userId);
+
+    if (!userFitnessData?.weight_kg) {
+      throw new InternalServerErrorException(
+        'User fitness data not found or invalid',
+      );
+    }
+
+    const met = this.getMetByPlan({
+      goals,
+      muscle_groups,
+    });
+
+
+    const calories = this.calculateCaloriesBurned(
+      userFitnessData.weight_kg,
+      Number(training_time) || 60,
+      met,
+    );
+    const exercises = data.map(
+      ({
+        workout_plan_id,
+        workout_plan_name,
+        training_time,
+        goals,
+        muscle_groups,
+        workout_type,
+        is_public,
+        ...exercise
+      }) => exercise,
+    );
+
+    return {
+      workout_plan_id,
+      name: workout_plan_name,
+      training_time,
+      muscle_groups,
+      goals,
+      workout_type,
+      is_public,
+      calories,
+      exercises,
+    };
+  }
+
+  private async getUserFitnessData(req, userId: string) {
+    const { data, error } = await req.supabase
+      .from('profile_fitness_data')
+      .select('*')
+      .eq('user_id', userId)
+      .single();
+
+    if (error) throw error;
     return data;
   }
-}
+
+  private calculateCaloriesBurned(
+    weightKg: number,
+    durationMinutes: number = 60,
+    met: number,
+  ) {
+    if (
+      !Number.isFinite(weightKg) ||
+      !Number.isFinite(durationMinutes) ||
+      !Number.isFinite(met) ||
+      durationMinutes <= 0
+    ) {
+      return null;
+    }
+
+    return Math.round(met * weightKg * (durationMinutes / 60));
+  }
+
+  private getMetByGoal(goal: string) {
+    switch (goal) {
+      case 'hipertrofia':
+        return 5.0;
+      case 'forca':
+        return 6.0;
+      default:
+        return 3.5;
+    }
+  }
+
+  private calculatePlanDurationMinutes(exercises: any[]) {
+    if (!exercises?.length) return 0;
+
+    return (
+      exercises.reduce((total, ex) => {
+        const sets = Number(ex.sets) || 0;
+        const rest = Number(ex.rest_time_seconds) || 0;
+
+        const secondsPerSet = 40 + rest;
+
+        return total + sets * secondsPerSet;
+      }, 0) / 60
+    );
+  }
+
+  private getMetByPlan(plan: any) {
+    const goals = Array.isArray(plan.goals) ? plan.goals : [];
+    const muscleGroups = Array.isArray(plan.muscle_groups)
+      ? plan.muscle_groups
+      : [];
+
+    let baseMet = 3.5;
+
+    if (goals.includes('Hipertrofia')) baseMet = 5.0;
+    if (goals.includes('Forca')) baseMet = 6.0;
+    if (goals.includes('Emagrecimento')) baseMet = 6.5;
+
+    // 🔥 ajuste por grupos musculares grandes
+    if (muscleGroups.includes('Pernas')) baseMet += 1.0;
+    if (muscleGroups.includes('Costas')) baseMet += 0.5;
+
+    return baseMet;
+  }
+};

@@ -15,6 +15,16 @@ import { SupabaseAuthGuard } from '../auth/auth.guard';
 export class WorkoutPlansController {
   constructor(private readonly service: WorkoutPlansService) { }
 
+  @Get('liked')
+  listMyLikedPlans(@Req() req) {
+    return this.service.listMyLikedPlans(req);
+  }
+
+  @Get('favorite')
+  listMyFavoritePlans(@Req() req) {
+    return this.service.listMyFavoritePlans(req);
+  }
+
   @Post()
   createPlan(@Req() req, @Body() dto) {
     return this.service.createPlan(req, dto);
@@ -31,6 +41,14 @@ export class WorkoutPlansController {
     @Param('id') planId: string,
   ) {
     return this.service.toggleLike(req, planId);
+  }
+
+  @Post(':id/favorite')
+  toggleFavorite(
+    @Req() req,
+    @Param('id') planId: string,
+  ) {
+    return this.service.toggleFavorite(req, planId);
   }
 
   @Get(':id')
