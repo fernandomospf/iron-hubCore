@@ -46,24 +46,21 @@ export class WorkoutPlansService {
     const userId = req.user.id;
 
     const userFitnessData = await this.getUserFitnessData(req, userId);
-
-    if (!userFitnessData?.weight_kg) {
-      throw new InternalServerErrorException(
-        'User fitness data not found or invalid',
-      );
-    }
+    // Removed 500 throw for missing fitness data
 
     const { data: plans, error } = await supabase
       .from('workout_plans')
       .select(`
-        *,
-        workout_exercises (*)
-      `)
+      *,
+      workout_exercises (*)
+    `)
       .eq('user_id', userId)
       .order('created_at', { ascending: false });
 
     if (error) throw error;
     if (!plans?.length) return [];
+
+    const planIds = plans.map(p => p.id);
 
     const { data: userLikes } = await supabase
       .from('workout_plan_likes')
@@ -75,35 +72,29 @@ export class WorkoutPlansService {
       .select('workout_plan_id')
       .eq('user_id', userId);
 
-    const favoriteSet = new Set(
-      (userFavorites ?? []).map(fav => fav.workout_plan_id)
-    );
+    const { data: allLikes } = await supabase
+      .from('workout_plan_likes')
+      .select('workout_plan_id')
+      .in('workout_plan_id', planIds);
 
     const likedSet = new Set(
-      (userLikes ?? []).map(like => like.workout_plan_id)
+      (userLikes ?? []).map(l => l.workout_plan_id),
     );
 
-    return plans.map((plan) => {
-      if (!plan.training_time) {
-        throw new InternalServerErrorException(
-          `Workout plan ${plan.id} missing training_time`,
-        );
-      }
+    const favoriteSet = new Set(
+      (userFavorites ?? []).map(f => f.workout_plan_id),
+    );
 
-      const primaryGoal =
-        Array.isArray(plan.goals) && plan.goals.length > 0
-          ? plan.goals[0]
-          : null;
+    const likesCountMap = (allLikes ?? []).reduce((acc, like) => {
+      acc[like.workout_plan_id] =
+        (acc[like.workout_plan_id] ?? 0) + 1;
+      return acc;
+    }, {} as Record<string, number>);
 
-      if (!primaryGoal) {
-        throw new InternalServerErrorException(
-          `Workout plan ${plan.id} missing goal`,
-        );
-      }
-
+    return plans.map(plan => {
       const met = this.getMetByPlan(plan);
       const calories = this.calculateCaloriesBurned(
-        userFitnessData.weight_kg,
+        userFitnessData?.weight_kg,
         Number(plan.training_time),
         met,
       );
@@ -113,89 +104,93 @@ export class WorkoutPlansService {
         calories,
         is_liked: likedSet.has(plan.id),
         is_favorited: favoriteSet.has(plan.id),
+        likes_count: likesCountMap[plan.id] ?? 0,
       };
     });
   }
 
   async listMyFavoritePlans(req) {
-  const supabase = req.supabase;
-  const userId = req.user.id;
+    const supabase = req.supabase;
+    const userId = req.user.id;
 
-  const userFitnessData = await this.getUserFitnessData(req, userId);
-  if (!userFitnessData?.weight_kg) {
-    throw new InternalServerErrorException(
-      'User fitness data not found or invalid',
-    );
+    const userFitnessData = await this.getUserFitnessData(req, userId);
+    // Removed 500 throw for missing fitness data
+
+    const { data: favorites, error: favError } = await supabase
+      .from('workout_plan_favorites')
+      .select('workout_plan_id')
+      .eq('user_id', userId);
+
+    if (favError) throw favError;
+    if (!favorites?.length) return [];
+
+    const favoritePlanIds = favorites.map(f => f.workout_plan_id);
+
+    const { data: plans, error: plansError } = await supabase
+      .from('workout_plans')
+      .select('*')
+      .in('id', favoritePlanIds)
+      .order('created_at', { ascending: false });
+
+    if (plansError) throw plansError;
+    if (!plans?.length) return [];
+
+    const planIds = plans.map(p => p.id);
+
+    const { data: allLikes } = await supabase
+      .from('workout_plan_likes')
+      .select('workout_plan_id')
+      .in('workout_plan_id', planIds);
+
+    const likesCountMap = (allLikes ?? []).reduce((acc, like) => {
+      acc[like.workout_plan_id] =
+        (acc[like.workout_plan_id] ?? 0) + 1;
+      return acc;
+    }, {} as Record<string, number>);
+
+    const { data: exercises, error: exercisesError } = await supabase
+      .from('workout_exercises')
+      .select('*')
+      .in('workout_plan_id', planIds);
+
+    if (exercisesError) throw exercisesError;
+
+    const exercisesByPlan = exercises.reduce((acc, ex) => {
+      if (!acc[ex.workout_plan_id]) acc[ex.workout_plan_id] = [];
+      acc[ex.workout_plan_id].push(ex);
+      return acc;
+    }, {} as Record<string, any[]>);
+
+    return plans.map(plan => {
+      const planExercises = exercisesByPlan[plan.id] ?? [];
+
+      const durationMinutes = this.calculatePlanDurationMinutes(planExercises);
+      const primaryGoal = Array.isArray(plan.goals) ? plan.goals[0] : plan.goals;
+      const met = this.getMetByGoal(primaryGoal);
+
+      const calories = this.calculateCaloriesBurned(
+        userFitnessData.weight_kg,
+        durationMinutes,
+        met,
+      );
+
+      return {
+        ...plan,
+        calories,
+        estimated_duration_minutes: Math.round(durationMinutes),
+        workout_exercises: planExercises,
+        is_favorited: true,
+        likes_count: likesCountMap[plan.id] ?? 0,
+      };
+    });
   }
-
-  const { data: favorites, error: favError } = await supabase
-    .from('workout_plan_favorites')
-    .select('workout_plan_id')
-    .eq('user_id', userId);
-
-  if (favError) throw favError;
-  if (!favorites?.length) return [];
-
-  const favoritePlanIds = favorites.map(f => f.workout_plan_id);
-
-  const { data: plans, error: plansError } = await supabase
-    .from('workout_plans')
-    .select('*')
-    .in('id', favoritePlanIds)
-    .order('created_at', { ascending: false });
-
-  if (plansError) throw plansError;
-  if (!plans?.length) return [];
-
-  const planIds = plans.map(p => p.id);
-
-  const { data: exercises, error: exercisesError } = await supabase
-    .from('workout_exercises')
-    .select('*')
-    .in('workout_plan_id', planIds);
-
-  if (exercisesError) throw exercisesError;
-
-  const exercisesByPlan = exercises.reduce((acc, ex) => {
-    if (!acc[ex.workout_plan_id]) acc[ex.workout_plan_id] = [];
-    acc[ex.workout_plan_id].push(ex);
-    return acc;
-  }, {} as Record<string, any[]>);
-
-  return plans.map(plan => {
-    const planExercises = exercisesByPlan[plan.id] ?? [];
-
-    const durationMinutes = this.calculatePlanDurationMinutes(planExercises);
-    const primaryGoal = Array.isArray(plan.goals) ? plan.goals[0] : plan.goals;
-    const met = this.getMetByGoal(primaryGoal);
-
-    const calories = this.calculateCaloriesBurned(
-      userFitnessData.weight_kg,
-      durationMinutes,
-      met,
-    );
-
-    return {
-      ...plan,
-      calories,
-      estimated_duration_minutes: Math.round(durationMinutes),
-      workout_exercises: planExercises,
-      is_favorited: true,
-    };
-  });
-}
 
   async listMyLikedPlans(req) {
     const supabase = req.supabase;
     const userId = req.user.id;
 
     const userFitnessData = await this.getUserFitnessData(req, userId);
-
-    if (!userFitnessData?.weight_kg) {
-      throw new InternalServerErrorException(
-        'User fitness data not found or invalid',
-      );
-    }
+    // Removed 500 throw for missing fitness data
 
     const { data: likes, error: likesError } = await supabase
       .from('workout_plan_likes')
@@ -217,6 +212,20 @@ export class WorkoutPlansService {
 
     if (plansError) throw plansError;
     if (!plans?.length) return [];
+
+    const planIds = plans.map((plan) => plan.id);
+
+    const { data: allLikes } = await supabase
+      .from('workout_plan_likes')
+      .select('workout_plan_id')
+      .in('workout_plan_id', planIds);
+
+    const likesCountMap = (allLikes ?? []).reduce((acc, like) => {
+      acc[like.workout_plan_id] =
+        (acc[like.workout_plan_id] ?? 0) + 1;
+      return acc;
+    }, {} as Record<string, number>);
+
 
     return plans.map(plan => {
       const primaryGoal =
@@ -240,6 +249,7 @@ export class WorkoutPlansService {
         ...plan,
         calories,
         is_liked: true,
+        likes_count: likesCountMap[plan.id] ?? 0,
       };
     });
   }
@@ -250,11 +260,7 @@ export class WorkoutPlansService {
     const { id: userId } = user;
 
     const userFitnessData = await this.getUserFitnessData(req, userId);
-    if (!userFitnessData?.weight_kg) {
-      throw new InternalServerErrorException(
-        'User fitness data not found or invalid',
-      );
-    }
+    // Removed 500 throw for missing fitness data
 
     const { data: likes, error: likesError } = await supabase
       .from('workout_plan_likes')
@@ -288,6 +294,11 @@ export class WorkoutPlansService {
 
     const planIds = plans.map(p => p.id);
 
+    const { data: allLikes } = await supabase
+      .from('workout_plan_likes')
+      .select('workout_plan_id')
+      .in('workout_plan_id', planIds);
+
     const { data: exercises, error: exercisesError } = await supabase
       .from('workout_exercises')
       .select('*')
@@ -315,6 +326,13 @@ export class WorkoutPlansService {
         met,
       );
 
+      const likesCountMap = (allLikes ?? []).reduce((acc, like) => {
+        acc[like.workout_plan_id] =
+          (acc[like.workout_plan_id] ?? 0) + 1;
+        return acc;
+      }, {} as Record<string, number>);
+
+
       return {
         ...plan,
         calories,
@@ -322,6 +340,7 @@ export class WorkoutPlansService {
         workout_exercises: planExercises,
         is_liked: likedSet.has(plan.id),
         is_favorited: favoriteSet.has(plan.id),
+        likes_count: likesCountMap[plan.id] || 0,
       };
     });
   }
@@ -425,12 +444,7 @@ export class WorkoutPlansService {
     } = data[0];
 
     const userFitnessData = await this.getUserFitnessData(req, userId);
-
-    if (!userFitnessData?.weight_kg) {
-      throw new InternalServerErrorException(
-        'User fitness data not found or invalid',
-      );
-    }
+    // Removed 500 throw for missing fitness data
 
     const met = this.getMetByPlan({
       goals,
@@ -439,7 +453,7 @@ export class WorkoutPlansService {
 
 
     const calories = this.calculateCaloriesBurned(
-      userFitnessData.weight_kg,
+      userFitnessData?.weight_kg,
       Number(training_time) || 60,
       met,
     );
@@ -474,7 +488,7 @@ export class WorkoutPlansService {
       .from('profile_fitness_data')
       .select('*')
       .eq('user_id', userId)
-      .single();
+      .maybeSingle();
 
     if (error) throw error;
     return data;
